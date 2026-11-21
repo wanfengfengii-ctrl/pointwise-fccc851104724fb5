@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from lake.custody.basis import read_exact_basis
-from lake.custody.catalog import CustodyCatalog, CustodyState
-from lake.editions.history import EditionHistory
+from lake.custody.basis import BasisObligations, read_exact_basis
 from lake.editions.manifest import ManifestStore
 from lake.editions.rows import FrozenRow
 from lake.ledger.detail import LedgerLine
 from lake.ledger.lookup import read_ledger
 from lake.ledger.publication import LedgerDelivery, publish_ledger
+from lake.receiving.admission import materialize_first_part
 from lake.receiving.commitments import missing_parts
 from lake.receiving.parts import PartReceipt, PartSource, PartStore, validate_replacements
 from lake.receiving.requests import RequestStore
@@ -35,12 +34,52 @@ def _snapshot(receiving: Database, supplement_id: str):
         return None, request, PartStore(conn).list_received(supplement_id)
 
 
+def _release(custody: Database, supplement_id: str) -> None:
+    with custody.transaction(write=True) as conn:
+        BasisObligations(conn).release(supplement_id)
+
+
+def _recover_admission(custody: Database, receiving: Database, supplement_id: str) -> None:
+    """Promote a staged first part that custody already authorized before a lost reply.
+
+    Formal admission lives in custody, so a staged receiving row may be waiting only on
+    the local write that followed it. The exact parent and digest come from the recorded
+    obligation rather than from any newer edition.
+    """
+    with receiving.transaction() as conn:
+        request = RequestStore(conn).find(supplement_id)
+    if request is None or request.status != 'staged':
+        return
+    with custody.transaction() as conn:
+        obligation = BasisObligations(conn).find(supplement_id)
+        if obligation is None:
+            return
+        if obligation.edition_id != request.parent_id or obligation.binding != request.binding:
+            raise LakeError('conflict', f'Supplement {supplement_id!r} is bound to different custody terms')
+        manifest = ManifestStore(conn).find(obligation.edition_id)
+        if manifest is None or manifest.digest != obligation.digest or manifest.row_count != obligation.row_count:
+            raise LakeError('basis_unavailable', f'Edition {obligation.edition_id!r} no longer fits its admission')
+        digest, row_count = obligation.digest, obligation.row_count
+    with receiving.transaction(write=True) as conn:
+        requests = RequestStore(conn)
+        current = requests.find(supplement_id)
+        if current is not None and current.status == 'staged':
+            current = requests.record_admission(current, digest, row_count)
+            materialize_first_part(PartStore(conn), current)
+
+
 def finish_supplement(
     custody: Database, receiving: Database, supplement_id: str, *, checkpoint: Checkpoint | None = None,
 ) -> LedgerDelivery:
     require_name(supplement_id, 'supplement ID')
     delivery, request, parts = _snapshot(receiving, supplement_id)
     if delivery is not None:
+        _release(custody, supplement_id)
+        return delivery
+    _recover_admission(custody, receiving, supplement_id)
+    delivery, request, parts = _snapshot(receiving, supplement_id)
+    if delivery is not None:
+        _release(custody, supplement_id)
         return delivery
     if request is None or request.status in ('staged', 'rejected'):
         raise LakeError('not_admitted', f'Supplement {supplement_id!r} has no formal admission')
@@ -51,20 +90,19 @@ def finish_supplement(
     if covered != set(request.commitment.part_ids) or request.digest is None or request.row_count is None:
         raise LakeError('basis_unavailable', f'Supplement {supplement_id!r} lacks verified material')
     try:
+        # The ledger is always assembled from the supplement's exact parent edition.
+        # A later edition for the same day is never substituted for the committed basis.
         with custody.transaction() as conn:
-            edition_id = request.parent_id
-            if CustodyCatalog(conn).state_for(edition_id) != CustodyState.OPEN:
-                manifest = ManifestStore(conn).find(edition_id)
-                edition_id = EditionHistory(conn).latest_for_day(manifest.day) or edition_id
-            evidence = read_exact_basis(conn, edition_id)
+            evidence = read_exact_basis(conn, request.parent_id)
             if (evidence.manifest.row_count != request.row_count
-                    or (edition_id == request.parent_id and evidence.manifest.digest != request.digest)):
+                    or evidence.manifest.digest != request.digest):
                 raise LakeError('basis_unavailable', f'Basis does not fit supplement {supplement_id!r}')
     except LakeError:
         # A concurrent finisher may have published and allowed reclaim since our first snapshot.
         with receiving.transaction() as conn:
             prior = read_ledger(conn, supplement_id)
         if prior is not None:
+            _release(custody, supplement_id)
             return prior
         raise
     lines = apply_replacements(evidence.rows, parts)
@@ -76,4 +114,5 @@ def finish_supplement(
         RequestStore(conn).mark_settled(supplement_id)
         notify(checkpoint, 'before_publication_commit', supplement_id)
     notify(checkpoint, 'after_publication_commit', supplement_id)
+    _release(custody, supplement_id)
     return delivery

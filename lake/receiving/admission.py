@@ -23,6 +23,16 @@ def _verify_terms(
         raise LakeError('expired', f'Edition {parent_id!r} is closed to new supplements')
 
 
+def materialize_first_part(parts: PartStore, request: SupplementRequest) -> None:
+    """Persist the staged first material once custody has formally admitted it."""
+    if parts.find(request.supplement_id, request.first_part_id) is not None:
+        return
+    covered = {part.part_id for part in parts.list_received(request.supplement_id)}
+    covered.add(request.first_part_id)
+    parts.insert(request.supplement_id, request.first_part_id, request.first_replacements,
+                 missing_parts(request.commitment, covered))
+
+
 def _receive(
     parts: PartStore, request: SupplementRequest, part_id: str, replacements: tuple[Replacement, ...],
 ) -> PartReceipt:
@@ -39,6 +49,37 @@ def _receive(
     covered = {part.part_id for part in received}
     covered.add(part_id)
     return parts.insert(request.supplement_id, part_id, replacements, missing_parts(request.commitment, covered))
+
+
+def _authorize(
+    custody: Database, request: SupplementRequest, parent_id: str, part_id: str,
+) -> tuple[str, int, bool]:
+    """Atomically decide admission against the exact parent and record its obligation.
+
+    Eligibility and the first-material obligation share one custody write transaction,
+    so an expiry either lands entirely before admission or entirely after it.
+    """
+    with custody.transaction(write=True) as conn:
+        obligations = BasisObligations(conn)
+        obligation = obligations.find(request.supplement_id)
+        if obligation is not None:
+            if obligation.edition_id != parent_id or obligation.binding != request.binding:
+                raise LakeError('conflict',
+                                f'Supplement {request.supplement_id!r} is bound to different custody terms')
+            manifest = ManifestStore(conn).find(obligation.edition_id)
+            if (manifest is None or manifest.digest != obligation.digest
+                    or manifest.row_count != obligation.row_count):
+                raise LakeError('basis_unavailable',
+                                f'Edition {obligation.edition_id!r} no longer fits its admission')
+            return obligation.digest, obligation.row_count, False
+        # Staging alone never qualifies a supplement; the parent must still be open.
+        check_public_eligibility(conn, parent_id)
+        if part_id != request.first_part_id:
+            raise LakeError('pending_first',
+                            f'First material for {request.supplement_id!r} is awaiting admission')
+        manifest = read_exact_basis(conn, parent_id).manifest
+        newly_authorized = obligations.note_open_read(request.supplement_id, manifest, request.binding)
+        return manifest.digest, manifest.row_count, newly_authorized
 
 
 def submit_part(
@@ -71,31 +112,27 @@ def submit_part(
             prepared = True
         _verify_terms(request, parent_id, commitment, part_id, replacements)
         if request.status != 'staged':
+            # Admitted or settled supplements keep working from their formal receipt scope.
             return _receive(PartStore(conn), request, part_id, replacements)
     if prepared:
         notify(checkpoint, 'first_staged', supplement_id)
 
     try:
-        with custody.transaction() as conn:
-            check_public_eligibility(conn, parent_id)
-            if part_id != request.first_part_id:
-                raise LakeError('pending_first', f'First material for {supplement_id!r} is awaiting admission')
-            manifest = read_exact_basis(conn, parent_id).manifest
+        digest, row_count, newly_authorized = _authorize(custody, request, parent_id, part_id)
     except LakeError as error:
         if error.code == 'expired':
             with receiving.transaction(write=True) as conn:
                 RequestStore(conn).reject(supplement_id)
         raise
-
-    with custody.transaction(write=True) as conn:
-        first_seen = BasisObligations(conn).note_open_read(supplement_id, manifest, request.binding)
-    if first_seen:
+    if newly_authorized:
         notify(checkpoint, 'first_authorized', supplement_id)
 
     with receiving.transaction(write=True) as conn:
         requests = RequestStore(conn)
         request = requests.find(supplement_id)
         _verify_terms(request, parent_id, commitment, part_id, replacements)
+        parts = PartStore(conn)
         if request.status == 'staged':
-            request = requests.record_admission(request, manifest.digest, manifest.row_count)
-        return _receive(PartStore(conn), request, part_id, replacements)
+            request = requests.record_admission(request, digest, row_count)
+            materialize_first_part(parts, request)
+        return _receive(parts, request, part_id, replacements)

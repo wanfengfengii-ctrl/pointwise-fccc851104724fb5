@@ -84,3 +84,11 @@ class BasisObligations:
             FROM basis_obligations WHERE edition_id = ? AND released = 0 ORDER BY supplement_id
         ''', (edition_id,))
         return tuple(self._decode(row) for row in rows)
+
+    def release(self, supplement_id: str) -> bool:
+        """Drop the original-material obligation once a supplement is settled."""
+        cursor = self.conn.execute('''
+            UPDATE basis_obligations SET released = 1
+            WHERE supplement_id = ? AND released = 0
+        ''', (supplement_id,))
+        return cursor.rowcount == 1
