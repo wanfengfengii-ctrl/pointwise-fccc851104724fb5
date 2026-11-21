@@ -1,0 +1,8 @@
+{
+  "supplement_id": "A",
+  "late_request_id": "B",
+  "parts": [
+    {"id": "white-shift", "replacements": [{"position": 0, "litres": 8}]},
+    {"id": "night-shift", "replacements": [{"position": 1, "litres": 13}]}
+  ]
+}

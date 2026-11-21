@@ -1,0 +1,21 @@
+{
+  "day": "2026-10-12",
+  "morning": {
+    "batch_id": "morning",
+    "issue_id": "morning-edition",
+    "records": [
+      {"record_id": "up", "source_name": "北堤", "value": 7000, "unit": "mL"},
+      {"record_id": "mid", "source_name": "南堤", "value": 11, "unit": "L"},
+      {"record_id": "tail", "source_name": "尾闸", "value": 5, "unit": "L"}
+    ]
+  },
+  "later": {
+    "batch_id": "later",
+    "issue_id": "later-edition",
+    "records": [
+      {"record_id": "up", "source_name": "北堤复报", "value": 7, "unit": "L"},
+      {"record_id": "mid", "source_name": "南堤复报", "value": 11000, "unit": "mL"},
+      {"record_id": "tail", "source_name": "尾闸复报", "value": 50, "unit": "L"}
+    ]
+  }
+}
